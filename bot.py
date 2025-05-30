@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import pytz
 import signal
 import sys
+from aiohttp import web
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +41,8 @@ application = None
 scheduler_running = False
 # Global event loop
 loop = None
+# Global web app
+web_app = None
 
 # Timezone settings
 IST = pytz.timezone('Asia/Kolkata')
@@ -449,8 +452,12 @@ async def send_task_reminder(user_id: str, task_id: int, task_description: str, 
     """Send a reminder for a specific task."""
     global bot_instance
     try:
-        current_time = get_current_time(user_id)
-        logger.info(f"Sending reminder for task {task_id} at {current_time} {get_user_timezone(user_id).zone}")
+        # Get current time in user's timezone
+        user_tz = get_user_timezone(user_id)
+        current_utc = datetime.now(pytz.UTC)
+        current_user_time = current_utc.astimezone(user_tz)
+        
+        logger.info(f"Sending reminder for task {task_id} at {current_user_time.strftime('%H:%M')} {user_tz.zone}")
         message = f'⏰ Task Reminder!\n\n{task_description}'
         await bot_instance.send_message(chat_id=user_id, text=message)
 
@@ -479,19 +486,25 @@ def schedule_task_reminder(user_id: str, task_id: int, time_str: str, task_descr
     def send_reminder():
         """Function to send reminder using the event loop."""
         try:
-            # Get current UTC time
+            # Get current time in UTC
             current_utc = datetime.now(pytz.UTC)
-            # Parse the scheduled UTC time
-            scheduled_utc = datetime.strptime(time_str, '%H:%M')
-            scheduled_utc = current_utc.replace(
-                hour=scheduled_utc.hour,
-                minute=scheduled_utc.minute,
+            
+            # Convert current UTC time to user's timezone
+            user_timezone = get_user_timezone(user_id)
+            current_user_time = current_utc.astimezone(user_timezone)
+            
+            # Parse the scheduled time in user's timezone
+            scheduled_time = datetime.strptime(local_time, '%H:%M')
+            scheduled_user_time = current_user_time.replace(
+                hour=scheduled_time.hour,
+                minute=scheduled_time.minute,
                 second=0,
                 microsecond=0
             )
             
             # Check if it's time to send the reminder
-            if current_utc.hour == scheduled_utc.hour and current_utc.minute == scheduled_utc.minute:
+            if (current_user_time.hour == scheduled_user_time.hour and 
+                current_user_time.minute == scheduled_user_time.minute):
                 logger.info(f"Triggering reminder for task {task_id} at {local_time} {user_tz}")
                 asyncio.run_coroutine_threadsafe(
                     send_task_reminder(user_id, task_id, task_description, is_recurring),
@@ -503,7 +516,7 @@ def schedule_task_reminder(user_id: str, task_id: int, time_str: str, task_descr
     # Schedule the new job to run every minute
     schedule.every(1).minutes.do(send_reminder).tag(job_id)
     
-    logger.info(f"Scheduled task {task_id} for user {user_id} at {local_time} {user_tz} (UTC: {time_str})")
+    logger.info(f"Scheduled task {task_id} for user {user_id} at {local_time} {user_tz}")
 
 def initialize_scheduled_tasks():
     """Initialize all scheduled tasks from the tasks file."""
@@ -535,6 +548,25 @@ def run_scheduler():
         except Exception as e:
             logger.error(f"Error in scheduler: {str(e)}")
             time.sleep(1)
+
+async def handle_health_check(request):
+    """Handle health check requests."""
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    """Start the web server for health checks."""
+    global web_app
+    web_app = web.Application()
+    web_app.router.add_get('/', handle_health_check)
+    
+    # Get port from environment variable or use default
+    port = int(os.getenv('PORT', 8080))
+    
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"Web server started on port {port}")
 
 def main():
     """Start the bot."""
@@ -568,6 +600,9 @@ def main():
         scheduler_thread.start()
 
         logger.info("Bot started successfully!")
+        
+        # Start the web server
+        loop.run_until_complete(start_web_server())
         
         # Start the bot with proper error handling
         application.run_polling(
