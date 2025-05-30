@@ -10,6 +10,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 import pytz
+import signal
+import sys
 
 # Load environment variables
 load_dotenv()
@@ -28,19 +30,95 @@ logger = logging.getLogger(__name__)
 
 # Store tasks in a JSON file
 TASKS_FILE = 'tasks.json'
+# Store user preferences in a JSON file
+PREFS_FILE = 'user_prefs.json'
 # Global bot instance
 bot_instance = None
+# Global application instance
+application = None
+# Global scheduler running flag
+scheduler_running = False
+# Global event loop
+loop = None
 
 # Timezone settings
 IST = pytz.timezone('Asia/Kolkata')
+US_EASTERN = pytz.timezone('US/Eastern')
 
-def convert_to_utc(time_str: str) -> str:
-    """Convert local time (IST) to UTC."""
+def load_user_prefs():
+    """Load user preferences from JSON file."""
+    try:
+        if os.path.exists(PREFS_FILE):
+            with open(PREFS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading user preferences: {str(e)}")
+        return {}
+
+def save_user_prefs(prefs):
+    """Save user preferences to JSON file."""
+    try:
+        with open(PREFS_FILE, 'w') as f:
+            json.dump(prefs, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving user preferences: {str(e)}")
+
+def get_user_timezone(user_id: str) -> pytz.timezone:
+    """Get user's preferred timezone."""
+    prefs = load_user_prefs()
+    user_tz = prefs.get(str(user_id), {}).get('timezone', 'IST')
+    return IST if user_tz == 'IST' else US_EASTERN
+
+async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set user's preferred timezone."""
+    try:
+        user_id = str(update.effective_user.id)
+        if not context.args:
+            await update.message.reply_text(
+                'Please specify your timezone:\n'
+                '/settimezone IST - for Indian Standard Time (UTC+5:30)\n'
+                '/settimezone US - for US Eastern Time (UTC-5)\n\n'
+                'Example: /settimezone IST'
+            )
+            return
+
+        timezone = context.args[0].upper()
+        if timezone not in ['IST', 'US']:
+            await update.message.reply_text(
+                'Invalid timezone. Please use:\n'
+                'IST - for Indian Standard Time (UTC+5:30)\n'
+                'US - for US Eastern Time (UTC-5)'
+            )
+            return
+
+        prefs = load_user_prefs()
+        if user_id not in prefs:
+            prefs[user_id] = {}
+        prefs[user_id]['timezone'] = timezone
+        save_user_prefs(prefs)
+
+        # Get current time in the new timezone
+        user_tz = get_user_timezone(user_id)
+        current_time = datetime.now(user_tz).strftime('%H:%M')
+
+        await update.message.reply_text(
+            f'✅ Timezone set to {timezone} successfully!\n'
+            f'Current time in your timezone: {current_time}\n\n'
+            'You can now add tasks using your local time.'
+        )
+    except Exception as e:
+        await update.message.reply_text(f'Error setting timezone: {str(e)}')
+
+def convert_to_utc(time_str: str, user_id: str) -> str:
+    """Convert user's local time to UTC."""
     try:
         # Parse the time string
         local_time = datetime.strptime(time_str, '%H:%M')
+        # Get user's timezone
+        user_tz = get_user_timezone(user_id)
         # Create a datetime object with today's date and the given time
-        local_dt = datetime.now(IST).replace(
+        local_dt = datetime.now(user_tz).replace(
             hour=local_time.hour,
             minute=local_time.minute,
             second=0,
@@ -53,8 +131,8 @@ def convert_to_utc(time_str: str) -> str:
         logger.error(f"Error converting time to UTC: {str(e)}")
         return time_str
 
-def convert_to_ist(time_str: str) -> str:
-    """Convert UTC time to IST."""
+def convert_from_utc(time_str: str, user_id: str) -> str:
+    """Convert UTC time to user's local time."""
     try:
         # Parse the time string
         utc_time = datetime.strptime(time_str, '%H:%M')
@@ -65,12 +143,31 @@ def convert_to_ist(time_str: str) -> str:
             second=0,
             microsecond=0
         )
-        # Convert to IST
-        ist_dt = utc_dt.astimezone(IST)
-        return ist_dt.strftime('%H:%M')
+        # Convert to user's timezone
+        user_tz = get_user_timezone(user_id)
+        local_dt = utc_dt.astimezone(user_tz)
+        return local_dt.strftime('%H:%M')
     except Exception as e:
-        logger.error(f"Error converting time to IST: {str(e)}")
+        logger.error(f"Error converting time from UTC: {str(e)}")
         return time_str
+
+def get_current_time(user_id: str) -> str:
+    """Get current time in user's timezone."""
+    user_tz = get_user_timezone(user_id)
+    return datetime.now(user_tz).strftime('%H:%M')
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    logger.info("Received shutdown signal. Cleaning up...")
+    global scheduler_running
+    scheduler_running = False
+    if application:
+        asyncio.run(application.stop())
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 def load_tasks():
     """Load tasks from JSON file with error handling."""
@@ -96,15 +193,32 @@ def save_tasks(tasks):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
+    user_id = str(update.effective_user.id)
+    
+    # Check if user has set timezone
+    prefs = load_user_prefs()
+    if user_id not in prefs or 'timezone' not in prefs[user_id]:
+        # Set default timezone to IST
+        if user_id not in prefs:
+            prefs[user_id] = {}
+        prefs[user_id]['timezone'] = 'IST'
+        save_user_prefs(prefs)
+        timezone_message = "Your timezone has been set to IST (Indian Standard Time) by default."
+    else:
+        timezone_message = f"Your current timezone is set to {prefs[user_id]['timezone']}."
+
     await update.message.reply_text(
         'Welcome to your Daily Task Bot! 🎯\n\n'
+        f'{timezone_message}\n\n'
         'Commands:\n'
         '/addtask <time> <task> - Add a new task (e.g., /addtask 14:30 Buy groceries)\n'
         '/addonetime <time> <task> - Add a one-time task\n'
         '/listtasks - List all your tasks\n'
         '/removetask <task_id> - Remove a task\n'
         '/stoptask <task_id> - Stop a recurring task\n'
-        '/help - Show this help message'
+        '/settimezone <timezone> - Set your timezone (IST or US)\n'
+        '/help - Show this help message\n\n'
+        'Note: Times should be in 24-hour format (HH:MM)'
     )
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,7 +243,11 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Convert local time to UTC for storage
-        utc_time = convert_to_utc(time_str)
+        utc_time = convert_to_utc(time_str, user_id)
+        current_time = get_current_time(user_id)
+        user_tz = get_user_timezone(user_id).zone
+        
+        logger.info(f"Adding task at {time_str} {user_tz} (UTC: {utc_time})")
 
         # Load existing tasks
         tasks = load_tasks()
@@ -155,7 +273,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f'Recurring daily task added successfully! 🎉\n'
             f'Task ID: {task_id}\n'
-            f'Time (IST): {time_str}\n'
+            f'Time ({user_tz}): {time_str}\n'
             f'Description: {task_description}\n'
             f'Type: Daily recurring'
         )
@@ -185,7 +303,11 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Convert local time to UTC for storage
-        utc_time = convert_to_utc(time_str)
+        utc_time = convert_to_utc(time_str, user_id)
+        current_time = get_current_time(user_id)
+        user_tz = get_user_timezone(user_id).zone
+        
+        logger.info(f"Adding one-time task at {time_str} {user_tz} (UTC: {utc_time})")
 
         # Process task description to handle multiple tasks
         tasks_list = [task.strip() for task in task_description.split('-') if task.strip()]
@@ -215,7 +337,7 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f'One-time task added successfully! 🎉\n'
             f'Task ID: {task_id}\n'
-            f'Time (IST): {time_str}\n'
+            f'Time ({user_tz}): {time_str}\n'
             f'Tasks:\n{formatted_description}\n'
             f'Type: One-time'
         )
@@ -227,6 +349,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all tasks for the user."""
     user_id = str(update.effective_user.id)
     tasks = load_tasks()
+    user_tz = get_user_timezone(user_id).zone
 
     if user_id not in tasks or not tasks[user_id]:
         await update.message.reply_text('You have no tasks scheduled.')
@@ -236,11 +359,11 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for task in tasks[user_id]:
         task_type = "Daily recurring" if task['is_recurring'] else "One-time"
         status = "Active" if task['is_active'] else "Stopped"
-        # Convert UTC time to IST for display
-        ist_time = convert_to_ist(task['time'])
+        # Convert UTC time to user's timezone for display
+        local_time = convert_from_utc(task['time'], user_id)
         message += (
             f"ID: {task['id']}\n"
-            f"Time (IST): {ist_time}\n"
+            f"Time ({user_tz}): {local_time}\n"
             f"Task: {task['description']}\n"
             f"Type: {task_type}\n"
             f"Status: {status}\n\n"
@@ -326,6 +449,8 @@ async def send_task_reminder(user_id: str, task_id: int, task_description: str, 
     """Send a reminder for a specific task."""
     global bot_instance
     try:
+        current_time = get_current_time(user_id)
+        logger.info(f"Sending reminder for task {task_id} at {current_time} {get_user_timezone(user_id).zone}")
         message = f'⏰ Task Reminder!\n\n{task_description}'
         await bot_instance.send_message(chat_id=user_id, text=message)
 
@@ -341,20 +466,44 @@ async def send_task_reminder(user_id: str, task_id: int, task_description: str, 
 
 def schedule_task_reminder(user_id: str, task_id: int, time_str: str, task_description: str, is_recurring: bool):
     """Schedule a reminder for a specific task."""
+    global loop
     job_id = f"task_{user_id}_{task_id}"
     
     # Clear any existing job with the same ID
     schedule.clear(job_id)
     
-    # Schedule the new job
-    if is_recurring:
-        schedule.every().day.at(time_str).do(
-            lambda: asyncio.run(send_task_reminder(user_id, task_id, task_description, True))
-        ).tag(job_id)
-    else:
-        schedule.every().day.at(time_str).do(
-            lambda: asyncio.run(send_task_reminder(user_id, task_id, task_description, False))
-        ).tag(job_id)
+    # Convert UTC time to user's timezone for logging
+    local_time = convert_from_utc(time_str, user_id)
+    user_tz = get_user_timezone(user_id).zone
+    
+    def send_reminder():
+        """Function to send reminder using the event loop."""
+        try:
+            # Get current UTC time
+            current_utc = datetime.now(pytz.UTC)
+            # Parse the scheduled UTC time
+            scheduled_utc = datetime.strptime(time_str, '%H:%M')
+            scheduled_utc = current_utc.replace(
+                hour=scheduled_utc.hour,
+                minute=scheduled_utc.minute,
+                second=0,
+                microsecond=0
+            )
+            
+            # Check if it's time to send the reminder
+            if current_utc.hour == scheduled_utc.hour and current_utc.minute == scheduled_utc.minute:
+                logger.info(f"Triggering reminder for task {task_id} at {local_time} {user_tz}")
+                asyncio.run_coroutine_threadsafe(
+                    send_task_reminder(user_id, task_id, task_description, is_recurring),
+                    loop
+                )
+        except Exception as e:
+            logger.error(f"Error in reminder function: {str(e)}")
+    
+    # Schedule the new job to run every minute
+    schedule.every(1).minutes.do(send_reminder).tag(job_id)
+    
+    logger.info(f"Scheduled task {task_id} for user {user_id} at {local_time} {user_tz} (UTC: {time_str})")
 
 def initialize_scheduled_tasks():
     """Initialize all scheduled tasks from the tasks file."""
@@ -372,21 +521,24 @@ def initialize_scheduled_tasks():
 
 def run_scheduler():
     """Run the scheduler in a separate thread."""
+    global scheduler_running, loop
     logger.info("Starting scheduler...")
+    scheduler_running = True
+    
     # Initialize all existing tasks
     initialize_scheduled_tasks()
     
-    while True:
+    while scheduler_running:
         try:
             schedule.run_pending()
-            time.sleep(60)
+            time.sleep(1)  # Check every second
         except Exception as e:
             logger.error(f"Error in scheduler: {str(e)}")
-            time.sleep(60)  # Wait before retrying
+            time.sleep(1)
 
 def main():
     """Start the bot."""
-    global bot_instance
+    global bot_instance, application, scheduler_running, loop
     
     # Get the token from environment variable
     token = os.getenv('TELEGRAM_TOKEN')
@@ -398,6 +550,7 @@ def main():
         # Create the Application
         application = Application.builder().token(token).build()
         bot_instance = application.bot
+        loop = asyncio.get_event_loop()
 
         # Add command handlers
         application.add_handler(CommandHandler("start", start))
@@ -407,6 +560,7 @@ def main():
         application.add_handler(CommandHandler("listtasks", list_tasks))
         application.add_handler(CommandHandler("removetask", remove_task))
         application.add_handler(CommandHandler("stoptask", stop_task))
+        application.add_handler(CommandHandler("settimezone", set_timezone))
 
         # Start the scheduler in a separate thread
         scheduler_thread = threading.Thread(target=run_scheduler)
@@ -415,10 +569,18 @@ def main():
 
         logger.info("Bot started successfully!")
         
-        # Start the bot
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Start the bot with proper error handling
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
+        scheduler_running = False
+        if application:
+            asyncio.run(application.stop())
+        sys.exit(1)
 
 if __name__ == '__main__':
     main() 

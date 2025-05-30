@@ -7,4 +7,7 @@ services:
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_TOKEN
-        sync: false 
+        sync: false
+    healthCheckPath: /
+    autoDeploy: true
+    plan: free 
