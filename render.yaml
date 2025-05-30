@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: daily-task-bot
+    env: python
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false 
