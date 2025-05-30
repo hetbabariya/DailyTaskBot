@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import schedule
 import time
 import threading
@@ -9,6 +9,7 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
+import pytz
 
 # Load environment variables
 load_dotenv()
@@ -29,6 +30,47 @@ logger = logging.getLogger(__name__)
 TASKS_FILE = 'tasks.json'
 # Global bot instance
 bot_instance = None
+
+# Timezone settings
+IST = pytz.timezone('Asia/Kolkata')
+
+def convert_to_utc(time_str: str) -> str:
+    """Convert local time (IST) to UTC."""
+    try:
+        # Parse the time string
+        local_time = datetime.strptime(time_str, '%H:%M')
+        # Create a datetime object with today's date and the given time
+        local_dt = datetime.now(IST).replace(
+            hour=local_time.hour,
+            minute=local_time.minute,
+            second=0,
+            microsecond=0
+        )
+        # Convert to UTC
+        utc_dt = local_dt.astimezone(pytz.UTC)
+        return utc_dt.strftime('%H:%M')
+    except Exception as e:
+        logger.error(f"Error converting time to UTC: {str(e)}")
+        return time_str
+
+def convert_to_ist(time_str: str) -> str:
+    """Convert UTC time to IST."""
+    try:
+        # Parse the time string
+        utc_time = datetime.strptime(time_str, '%H:%M')
+        # Create a datetime object with today's date and the given time
+        utc_dt = datetime.now(pytz.UTC).replace(
+            hour=utc_time.hour,
+            minute=utc_time.minute,
+            second=0,
+            microsecond=0
+        )
+        # Convert to IST
+        ist_dt = utc_dt.astimezone(IST)
+        return ist_dt.strftime('%H:%M')
+    except Exception as e:
+        logger.error(f"Error converting time to IST: {str(e)}")
+        return time_str
 
 def load_tasks():
     """Load tasks from JSON file with error handling."""
@@ -86,6 +128,9 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text('Invalid time format. Please use HH:MM format (e.g., 14:30)')
             return
 
+        # Convert local time to UTC for storage
+        utc_time = convert_to_utc(time_str)
+
         # Load existing tasks
         tasks = load_tasks()
         if user_id not in tasks:
@@ -95,7 +140,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = len(tasks[user_id]) + 1
         tasks[user_id].append({
             'id': task_id,
-            'time': time_str,
+            'time': utc_time,  # Store UTC time
             'description': task_description,
             'is_recurring': True,
             'is_active': True
@@ -104,13 +149,13 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Save tasks
         save_tasks(tasks)
 
-        # Schedule the task
-        schedule_task_reminder(user_id, task_id, time_str, task_description, is_recurring=True)
+        # Schedule the task using UTC time
+        schedule_task_reminder(user_id, task_id, utc_time, task_description, is_recurring=True)
 
         await update.message.reply_text(
             f'Recurring daily task added successfully! 🎉\n'
             f'Task ID: {task_id}\n'
-            f'Time: {time_str}\n'
+            f'Time (IST): {time_str}\n'
             f'Description: {task_description}\n'
             f'Type: Daily recurring'
         )
@@ -139,6 +184,9 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text('Invalid time format. Please use HH:MM format (e.g., 14:30)')
             return
 
+        # Convert local time to UTC for storage
+        utc_time = convert_to_utc(time_str)
+
         # Process task description to handle multiple tasks
         tasks_list = [task.strip() for task in task_description.split('-') if task.strip()]
         formatted_description = '\n'.join([f"• {task}" for task in tasks_list])
@@ -152,7 +200,7 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = len(tasks[user_id]) + 1
         tasks[user_id].append({
             'id': task_id,
-            'time': time_str,
+            'time': utc_time,  # Store UTC time
             'description': formatted_description,
             'is_recurring': False,
             'is_active': True
@@ -161,13 +209,13 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Save tasks
         save_tasks(tasks)
 
-        # Schedule the task
-        schedule_task_reminder(user_id, task_id, time_str, formatted_description, is_recurring=False)
+        # Schedule the task using UTC time
+        schedule_task_reminder(user_id, task_id, utc_time, formatted_description, is_recurring=False)
 
         await update.message.reply_text(
             f'One-time task added successfully! 🎉\n'
             f'Task ID: {task_id}\n'
-            f'Time: {time_str}\n'
+            f'Time (IST): {time_str}\n'
             f'Tasks:\n{formatted_description}\n'
             f'Type: One-time'
         )
@@ -188,9 +236,11 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for task in tasks[user_id]:
         task_type = "Daily recurring" if task['is_recurring'] else "One-time"
         status = "Active" if task['is_active'] else "Stopped"
+        # Convert UTC time to IST for display
+        ist_time = convert_to_ist(task['time'])
         message += (
             f"ID: {task['id']}\n"
-            f"Time: {task['time']}\n"
+            f"Time (IST): {ist_time}\n"
             f"Task: {task['description']}\n"
             f"Type: {task_type}\n"
             f"Status: {status}\n\n"
