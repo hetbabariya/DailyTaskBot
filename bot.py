@@ -6,7 +6,7 @@ import schedule
 import time
 import threading
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 import pytz
@@ -49,6 +49,13 @@ web_app = None
 # Timezone settings
 IST = pytz.timezone('Asia/Kolkata')
 US_EASTERN = pytz.timezone('US/Eastern')
+
+# Add these constants at the top with other constants
+TASK_STATUS = {
+    'NOT_STARTED': '⏳ Not Started',
+    'PENDING': '🔄 Pending',
+    'DONE': '✅ Done'
+}
 
 def load_user_prefs():
     """Load user preferences from JSON file."""
@@ -182,7 +189,13 @@ def load_tasks():
                 content = f.read()
                 if not content.strip():  # If file is empty
                     return {}
-                return json.loads(content)
+                tasks = json.loads(content)
+                # Ensure each task has a status
+                for user_tasks in tasks.values():
+                    for task in user_tasks:
+                        if 'status' not in task:
+                            task['status'] = 'NOT_STARTED'
+                return tasks
         return {}
     except (json.JSONDecodeError, IOError) as e:
         logger.error(f"Error loading tasks: {str(e)}")
@@ -350,31 +363,194 @@ async def add_one_time_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f'Error adding task: {str(e)}')
 
+async def show_tasks_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, page: int = 0, filter_type: str = 'all'):
+    """Show a page of tasks with pagination."""
+    tasks = load_tasks()
+    user_tz = get_user_timezone(user_id).zone
+    
+    if user_id not in tasks or not tasks[user_id]:
+        if update.callback_query:
+            await update.callback_query.edit_message_text('No tasks found.')
+        else:
+            await update.message.reply_text('No tasks found.')
+        return
+    
+    # Filter tasks based on status
+    if filter_type == 'all':
+        filtered_tasks = tasks[user_id]
+    else:
+        status_map = {
+            'done': 'DONE',
+            'not_started': 'NOT_STARTED',
+            'pending': 'PENDING'
+        }
+        target_status = status_map.get(filter_type)
+        logger.info(f"Filtering tasks for status: {target_status}")
+        
+        filtered_tasks = []
+        for task in tasks[user_id]:
+            task_status = task.get('status', 'NOT_STARTED')
+            if task_status == target_status:
+                filtered_tasks.append(task)
+                logger.info(f"Task {task['id']} matches filter {target_status}")
+    
+    logger.info(f"Found {len(filtered_tasks)} tasks matching filter {filter_type}")
+    
+    if not filtered_tasks:
+        message = f'No {filter_type.replace("_", " ")} tasks found.'
+        if update.callback_query:
+            await update.callback_query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
+        return
+    
+    # Calculate pagination - show only 1 task per page
+    TASKS_PER_PAGE = 1
+    total_pages = len(filtered_tasks)
+    page = max(0, min(page, total_pages - 1))  # Ensure page is within bounds
+    
+    # Get the current task
+    current_task = filtered_tasks[page]
+    
+    # Build message with detailed task information
+    task_type = "Daily recurring" if current_task['is_recurring'] else "One-time"
+    status = TASK_STATUS.get(current_task.get('status', 'NOT_STARTED'), '⏳ Not Started')
+    local_time = convert_from_utc(current_task['time'], user_id)
+    
+    message = (
+        f"📋 Task Details (Page {page + 1} of {total_pages})\n\n"
+        f"Task ID: {current_task['id']}\n"
+        f"Time ({user_tz}): {local_time}\n"
+        f"Type: {task_type}\n"
+        f"Status: {status}\n"
+        f"Description:\n{current_task['description']}\n"
+    )
+    
+    # Create keyboard with status buttons
+    keyboard = []
+    
+    # Add status buttons for the current task
+    status_buttons = []
+    for status, label in TASK_STATUS.items():
+        display_label = f"✓ {label}" if status == current_task.get('status', 'NOT_STARTED') else label
+        status_buttons.append(
+            InlineKeyboardButton(
+                display_label,
+                callback_data=f"status:{user_id}:{current_task['id']}:{status}"
+            )
+        )
+    keyboard.append(status_buttons)
+    
+    # Add navigation buttons
+    nav_buttons = []
+    if total_pages > 1:
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page:{user_id}:{page-1}:{filter_type}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page:{user_id}:{page+1}:{filter_type}"))
+        keyboard.append(nav_buttons)
+    
+    # Add filter buttons
+    keyboard.append([
+        InlineKeyboardButton("📋 All Tasks", callback_data=f"filter:all:{user_id}:0"),
+        InlineKeyboardButton("✅ Done", callback_data=f"filter:done:{user_id}:0"),
+        InlineKeyboardButton("⏳ Not Started", callback_data=f"filter:not_started:{user_id}:0"),
+        InlineKeyboardButton("🔄 Pending", callback_data=f"filter:pending:{user_id}:0")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message, reply_markup=reply_markup)
+
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all tasks for the user."""
     user_id = str(update.effective_user.id)
-    tasks = load_tasks()
-    user_tz = get_user_timezone(user_id).zone
+    await show_tasks_page(update, context, user_id, 0, 'all')
 
-    if user_id not in tasks or not tasks[user_id]:
-        await update.message.reply_text('You have no tasks scheduled.')
-        return
+async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pagination navigation."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        _, user_id, page, filter_type = query.data.split(':')
+        await show_tasks_page(update, context, user_id, int(page), filter_type)
+    except Exception as e:
+        logger.error(f"Error in pagination: {str(e)}")
+        await query.edit_message_text("Error navigating pages.")
 
-    message = 'Your scheduled tasks:\n\n'
-    for task in tasks[user_id]:
-        task_type = "Daily recurring" if task['is_recurring'] else "One-time"
-        status = "Active" if task['is_active'] else "Stopped"
-        # Convert UTC time to user's timezone for display
-        local_time = convert_from_utc(task['time'], user_id)
-        message += (
-            f"ID: {task['id']}\n"
-            f"Time ({user_tz}): {local_time}\n"
-            f"Task: {task['description']}\n"
-            f"Type: {task_type}\n"
-            f"Status: {status}\n\n"
-        )
+async def filter_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Filter tasks by status."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Parse the callback data with the new format
+        parts = query.data.split(':')
+        if len(parts) != 4:
+            raise ValueError("Invalid callback data format")
+            
+        # The format is "filter:type:user_id:page"
+        filter_type = parts[1]  # Changed from parts[0] to parts[1]
+        user_id = parts[2]      # Changed from parts[1] to parts[2]
+        page = int(parts[3])    # Changed from parts[2] to parts[3]
+        
+        logger.info(f"Filtering tasks for user {user_id} with filter type {filter_type}")
+        
+        # Reset to first page when filtering
+        await show_tasks_page(update, context, user_id, 0, filter_type)
+    except Exception as e:
+        logger.error(f"Error filtering tasks: {str(e)}")
+        await query.edit_message_text("Error filtering tasks. Please try again.")
 
-    await update.message.reply_text(message)
+async def update_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle task status update from inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Parse the callback data
+        _, user_id, task_id, new_status = query.data.split(':')
+        task_id = int(task_id)
+        
+        # Load tasks
+        tasks = load_tasks()
+        if user_id not in tasks:
+            await query.edit_message_text("No tasks found.")
+            return
+            
+        # Find and update the task
+        task = next((t for t in tasks[user_id] if t['id'] == task_id), None)
+        if not task:
+            await query.edit_message_text("Task not found.")
+            return
+            
+        # Update status
+        old_status = task.get('status', 'NOT_STARTED')
+        task['status'] = new_status
+        save_tasks(tasks)
+        
+        logger.info(f"Updated task {task_id} status from {old_status} to {new_status}")
+        
+        # Get current page and filter type from the message
+        current_page = 0
+        filter_type = 'all'
+        if query.message.text:
+            if "Page" in query.message.text:
+                page_info = query.message.text.split("Page")[1].split("of")[0].strip()
+                current_page = int(page_info) - 1
+            if "Tasks" in query.message.text:
+                filter_type = query.message.text.split("Tasks")[0].strip().lower().replace(" ", "_")
+        
+        # Show the updated page
+        await show_tasks_page(update, context, user_id, current_page, filter_type)
+        
+    except Exception as e:
+        logger.error(f"Error updating task status: {str(e)}")
+        await query.edit_message_text("Error updating task status. Please try again.")
 
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove a task by ID."""
@@ -619,6 +795,47 @@ async def start_polling_with_retry(application):
         logger.error(f"Error in polling: {str(e)}")
         raise
 
+async def remove_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove all tasks for the user."""
+    user_id = str(update.effective_user.id)
+    tasks = load_tasks()
+    
+    if user_id not in tasks or not tasks[user_id]:
+        await update.message.reply_text('You have no tasks to remove.')
+        return
+    
+    # Create confirmation keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes, remove all", callback_data=f"confirm_remove_all:{user_id}"),
+            InlineKeyboardButton("No, cancel", callback_data=f"cancel_remove_all:{user_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        'Are you sure you want to remove all your tasks?',
+        reply_markup=reply_markup
+    )
+
+async def handle_remove_all_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle confirmation for removing all tasks."""
+    query = update.callback_query
+    await query.answer()
+    
+    action, user_id = query.data.split(':')
+    
+    if action == 'confirm_remove_all':
+        tasks = load_tasks()
+        if user_id in tasks:
+            tasks[user_id] = []
+            save_tasks(tasks)
+            await query.edit_message_text('All tasks have been removed.')
+        else:
+            await query.edit_message_text('No tasks found to remove.')
+    else:
+        await query.edit_message_text('Task removal cancelled.')
+
 def main():
     """Start the bot."""
     global bot_instance, application, scheduler_running, loop
@@ -645,6 +862,13 @@ def main():
         application.add_handler(CommandHandler("removetask", remove_task))
         application.add_handler(CommandHandler("stoptask", stop_task))
         application.add_handler(CommandHandler("settimezone", set_timezone))
+        application.add_handler(CommandHandler("removeall", remove_all_tasks))
+
+        # Add callback query handlers with updated patterns
+        application.add_handler(CallbackQueryHandler(update_task_status, pattern=r'^status:\d+:\d+:\w+$'))
+        application.add_handler(CallbackQueryHandler(handle_pagination, pattern=r'^page:\d+:-?\d+:\w+$'))
+        application.add_handler(CallbackQueryHandler(handle_remove_all_confirmation, pattern=r'^(confirm|cancel)_remove_all:\d+$'))
+        application.add_handler(CallbackQueryHandler(filter_tasks, pattern=r'^filter:\w+:\d+:\d+$'))
 
         # Add error handler
         async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
