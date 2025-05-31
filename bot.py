@@ -562,11 +562,30 @@ async def start_web_server():
     # Get port from environment variable or use default
     port = int(os.getenv('PORT', 8080))
     
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logger.info(f"Web server started on port {port}")
+    try:
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"Web server started on port {port}")
+    except OSError as e:
+        if e.errno == 10048:  # Port already in use
+            logger.warning(f"Port {port} is already in use. Trying alternative port...")
+            # Try alternative ports
+            for alt_port in range(8081, 8090):
+                try:
+                    site = web.TCPSite(runner, '0.0.0.0', alt_port)
+                    await site.start()
+                    logger.info(f"Web server started on alternative port {alt_port}")
+                    break
+                except OSError:
+                    continue
+            else:
+                logger.error("Could not find an available port. Web server not started.")
+                return
+        else:
+            logger.error(f"Error starting web server: {str(e)}")
+            return
 
 def main():
     """Start the bot."""
@@ -582,7 +601,8 @@ def main():
         # Create the Application
         application = Application.builder().token(token).build()
         bot_instance = application.bot
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         # Add command handlers
         application.add_handler(CommandHandler("start", start))
@@ -608,12 +628,15 @@ def main():
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
-            close_loop=False
+            close_loop=False,
+            timeout=30,  # Increase timeout to 30 seconds
+            poll_interval=1.0,  # Add 1 second delay between polls
+            bootstrap_retries=5  # Retry 5 times if initial connection fails
         )
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
         scheduler_running = False
-        if application:
+        if application and application.running:
             asyncio.run(application.stop())
         sys.exit(1)
 
