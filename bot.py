@@ -13,6 +13,8 @@ import pytz
 import signal
 import sys
 from aiohttp import web
+from telegram.error import Conflict, NetworkError, TimedOut
+import backoff
 
 # Load environment variables
 load_dotenv()
@@ -587,6 +589,36 @@ async def start_web_server():
             logger.error(f"Error starting web server: {str(e)}")
             return
 
+@backoff.on_exception(
+    backoff.expo,
+    (Conflict, NetworkError, TimedOut),
+    max_tries=5,
+    max_time=300
+)
+async def start_polling_with_retry(application):
+    """Start polling with retry logic for handling conflicts."""
+    try:
+        # Initialize the application first
+        await application.initialize()
+        
+        # Start the application
+        await application.start()
+        
+        # Now start polling
+        await application.updater.start_polling(
+            poll_interval=1.0,
+            timeout=30,
+            bootstrap_retries=5,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Conflict as e:
+        logger.warning(f"Conflict detected: {str(e)}. Retrying...")
+        raise  # Let backoff handle the retry
+    except Exception as e:
+        logger.error(f"Error in polling: {str(e)}")
+        raise
+
 def main():
     """Start the bot."""
     global bot_instance, application, scheduler_running, loop
@@ -614,6 +646,19 @@ def main():
         application.add_handler(CommandHandler("stoptask", stop_task))
         application.add_handler(CommandHandler("settimezone", set_timezone))
 
+        # Add error handler
+        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Handle errors in the bot."""
+            logger.error(f"Exception while handling an update: {context.error}")
+            if isinstance(context.error, Conflict):
+                logger.warning("Conflict detected. The bot will retry automatically.")
+            elif isinstance(context.error, NetworkError):
+                logger.warning("Network error detected. The bot will retry automatically.")
+            elif isinstance(context.error, TimedOut):
+                logger.warning("Request timed out. The bot will retry automatically.")
+
+        application.add_error_handler(error_handler)
+
         # Start the scheduler in a separate thread
         scheduler_thread = threading.Thread(target=run_scheduler)
         scheduler_thread.daemon = True
@@ -624,15 +669,19 @@ def main():
         # Start the web server
         loop.run_until_complete(start_web_server())
         
-        # Start the bot with proper error handling
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False,
-            timeout=30,  # Increase timeout to 30 seconds
-            poll_interval=1.0,  # Add 1 second delay between polls
-            bootstrap_retries=5  # Retry 5 times if initial connection fails
-        )
+        # Start the bot with retry logic
+        loop.run_until_complete(start_polling_with_retry(application))
+        
+        # Keep the main thread alive
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Received shutdown signal")
+        finally:
+            if application.running:
+                loop.run_until_complete(application.stop())
+            loop.close()
+            
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
         scheduler_running = False
