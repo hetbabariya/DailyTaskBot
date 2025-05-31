@@ -171,10 +171,22 @@ def get_current_time(user_id: str) -> str:
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
     logger.info("Received shutdown signal. Cleaning up...")
-    global scheduler_running
+    global scheduler_running, application, loop
     scheduler_running = False
-    if application:
-        asyncio.run(application.stop())
+    
+    if application and application.running:
+        # Create a new event loop for cleanup if needed
+        try:
+            cleanup_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(cleanup_loop)
+            cleanup_loop.run_until_complete(application.stop())
+            cleanup_loop.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+    
+    if loop and loop.is_running():
+        loop.stop()
+    
     sys.exit(0)
 
 # Register signal handlers
@@ -850,6 +862,8 @@ def main():
         # Create the Application
         application = Application.builder().token(token).build()
         bot_instance = application.bot
+        
+        # Create and set the event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -900,17 +914,26 @@ def main():
         try:
             loop.run_forever()
         except KeyboardInterrupt:
-            logger.info("Received shutdown signal")
+            logger.info("Received keyboard interrupt")
         finally:
-            if application.running:
+            # Cleanup
+            if application and application.running:
                 loop.run_until_complete(application.stop())
-            loop.close()
+            if loop and loop.is_running():
+                loop.stop()
+            if loop and not loop.is_closed():
+                loop.close()
             
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
         scheduler_running = False
         if application and application.running:
-            asyncio.run(application.stop())
+            try:
+                loop.run_until_complete(application.stop())
+            except Exception as stop_error:
+                logger.error(f"Error stopping application: {str(stop_error)}")
+        if loop and not loop.is_closed():
+            loop.close()
         sys.exit(1)
 
 if __name__ == '__main__':
